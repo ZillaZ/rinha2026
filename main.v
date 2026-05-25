@@ -6,7 +6,10 @@ import x.json2
 import v.util
 import time
 import math
-import net.http
+import os
+import zillaz.hnsw
+import encoding.binary
+import arrays
 
 struct TransactionInfo {
 	amount       f64
@@ -102,75 +105,174 @@ struct Normalization {
 	max_merchant_avg_amount f64
 }
 
-struct QDrantBatch {
-	ids      []int
-	vectors  [][]f64
-	payloads []map[string]string
+const collection = 'rinha'
+const collection_distance = 'Cosine'
+
+fn get_reference(file os.File) !(Reference, i64) {
+	mut line := []u8{len: 10000, cap: 30000, init: 0}
+	bytes := file.read_bytes_with_newline(mut &line)!
+	ret := json2.decode[Reference](line[..bytes].bytestr())!
+	return ret, bytes
 }
 
-struct QDrantBatchReq {
-	batch QDrantBatch
+struct ReferenceIndex {
+	dot_prod f64
+	offset   i64
 }
 
-fn init() {
-	res := http.put('http://localhost:6333/collections/rinha',
-		'{"vectors": { "size": 14, "distance": "Cosine" }}') or { panic(err) }
-	println(res)
+struct Index {
+mut:
+	offsets []ReferenceIndex
+}
 
-	mut ids := []int{}
-	for i, _ in references {
-		ids << i
+fn (mut self Index) combine(index Index) {
+	for offset in index.offsets {
+		self.offsets << offset
 	}
-	payload := QDrantBatchReq{
-		batch: QDrantBatch{
-			ids:      ids
-			vectors:  references.map(fn (v Reference) []f64 {
-				return v.vector
-			})
-			payloads: references.map(fn (v Reference) map[string]string {
-				return {
-					'label': v.label
-				}
-			})
+}
+
+const factor = 1000.0
+
+struct Offset {
+	start i64
+mut:
+	end i64
+}
+
+const workers = 4
+
+fn gen_offsets(path string) []Offset {
+	stat := os.stat(path) or { panic(err) }
+	file := os.open(path) or { panic(err) }
+	apprx_size := stat.size / workers
+	mut line := []u8{len: 200, cap: 200, init: 0}
+	mut end := i64(0)
+	mut ret := []Offset{}
+	for i in 0 .. workers {
+		offset := apprx_size * i
+		file.seek(offset, os.SeekMode.start) or { panic(err) }
+		bytes := file.read_bytes_with_newline(mut &line) or { break }
+		end = offset + i64(bytes)
+		if i == 0 {
+			ret << Offset{
+				start: 0
+				end:   0
+			}
+			continue
+		}
+		ret[i - 1].end = end
+		ret << Offset{
+			start: end
+			end:   0
 		}
 	}
+	ret[workers - 1].end = end
+	return ret
+}
 
-	pres := http.put('http://localhost:6333/collections/rinha/points', json2.encode(payload)) or {
-		panic(err)
+fn dot_prod(one []f64, other []f64) f64 {
+	mut dot := 0.0
+	mut norm_a := 0.0
+	mut norm_b := 0.0
+
+	for i in 0 .. one.len {
+		dot += one[i] * other[i]
+		norm_a += one[i] * one[i]
+		norm_b += other[i] * other[i]
 	}
-	println(pres)
-}
 
-struct QDrantQuery {
-	query        []f64
-	limit        int
-	with_payload bool
-}
-
-struct QDrantPoint {
-	id      int
-	payload map[string]string
-}
-
-struct QDrantQueryResult {
-	points []QDrantPoint
-}
-
-struct QDrantQueryResponse {
-	result QDrantQueryResult
-}
-
-fn get_closest(transaction Transaction) ![]main.QDrantPoint {
-	vector := transaction.vectorize()!
-	payload := QDrantQuery{
-		query:        vector
-		limit:        5
-		with_payload: true
+	if norm_a == 0 || norm_b == 0 {
+		return 0.0
 	}
-	res := http.post('http://localhost:6333/collections/rinha/points/query', json2.encode(payload))!
-	println(res)
-	response := json2.decode[QDrantQueryResponse](res.body)!
-	return response.result.points
+
+	return dot / (math.sqrt(norm_a) * math.sqrt(norm_b))
+}
+
+fn db_worker(channel chan &map[f64]Index, offset Offset) {
+	file := os.open('formatted.json') or { panic(err) }
+	mut count := 0.0
+	mut final := map[f64]Index{}
+	mut final_aux := -1.0
+	for final_aux <= 1.0 {
+		final[final_aux] = Index{}
+		final_aux += 1 / factor
+	}
+	pivot, _ := get_reference(file) or { panic(err) }
+	file.seek(offset.start, os.SeekMode.start) or { panic(err) }
+	mut acc_bytes := offset.start
+	max := 10000.0
+	for {
+		if count == max {
+			break
+		}
+		println('${(count / max) * 100}% (${count})')
+		reference, bytecount := get_reference(file) or { break }
+		acc_bytes += bytecount
+		distance := dot_prod(reference.vector, pivot.vector)
+		aux := int(distance * factor)
+		new := f64(aux) / factor
+		if mut entry := final[new] {
+			entry.offsets << ReferenceIndex{
+				dot_prod: dot_prod(reference.vector, pivot.vector)
+				offset:   acc_bytes
+			}
+			final[new] = entry
+		} else {
+			final[new] = Index{
+				offsets: [
+					ReferenceIndex{
+						dot_prod: dot_prod(reference.vector, pivot.vector)
+						offset:   acc_bytes
+					},
+				]
+			}
+		}
+		count += 1
+	}
+	channel <- &final
+}
+
+fn init_db(mut db hnsw.HNSW[Reference]) {
+	offsets := gen_offsets('formatted.json')
+	channel := chan &map[f64]Index{cap: workers}
+	mut threads := []thread{}
+	for i in 0 .. workers {
+		copy := offsets[i]
+		threads << spawn db_worker(channel, copy)
+	}
+	threads.wait()
+	channel.close()
+	mut final := map[f64]Index{}
+	file := os.open('formatted.json') or { panic(err) }
+
+	for {
+		value := <-channel or { break }
+		println('got all values, building database...')
+		mut count := 0.0
+		for key, index in value {
+			count += 1.0
+			if mut aux := final[key] {
+				for i in index.offsets {
+					file.seek(i.offset, os.SeekMode.start) or { panic(err) }
+					reference, _ := get_reference(file) or { panic(err) }
+					stopwatch := time.new_stopwatch(time.StopWatchOptions{})
+					db.insert(reference)
+					println('(${count / value.len * 100}%) reference inserted in ${stopwatch.elapsed().milliseconds()}ms')
+					aux.offsets << i
+				}
+				final[key] = aux
+				continue
+			}
+			for i in index.offsets {
+				file.seek(i.offset, os.SeekMode.start) or { panic(err) }
+				reference, _ := get_reference(file) or { panic(err) }
+				stopwatch := time.new_stopwatch(time.StopWatchOptions{})
+				db.insert(reference)
+				println('(${count / value.len * 100}%) reference inserted in ${stopwatch.elapsed().milliseconds()}ms')
+			}
+			final[key] = index
+		}
+	}
 }
 
 const default_ok = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'
@@ -185,7 +287,48 @@ struct Reference {
 	label  string
 }
 
-const references = json2.decode[[]Reference](util.read_file('testdataset.json')!)!
+pub fn (self Reference) to_bytes() []u8 {
+	mut ret := [][]u8{}
+	for x in self.vector {
+		bits := math.f64_bits(x)
+		aux := binary.big_endian_get_u64(bits)
+		ret << aux
+	}
+	mut label_bytes := self.label.bytes()
+	for _ in label_bytes.len .. 6 {
+		label_bytes << 0
+	}
+	ret << label_bytes
+
+	fret := arrays.flatten(ret)
+	return fret
+}
+
+pub fn Reference.from_bytes(bytes []u8) Reference {
+	mut vector := []f64{}
+	for i in 0 .. 14 {
+		bits := binary.big_endian_u64_at(bytes, 8 * i)
+
+		vector << math.f64_from_bits(bits)
+	}
+	label := bytes[14 * 8..].bytestr()
+	return Reference{
+		vector: vector
+		label:  label
+	}
+}
+
+pub fn Reference.byte_size() int {
+	return 14 * 8 + 6
+}
+
+pub fn (self Reference) distance_to(other Reference) f64 {
+	mut distance := 0.0
+	for i in 0 .. 14 {
+		distance += math.pow(self.vector[i] - other.vector[i], 2.0)
+	}
+	return math.sqrt(distance)
+}
 
 struct MyResponse {
 	status         int
@@ -201,7 +344,8 @@ fn (self MyResponse) serialize() string {
 	}
 	serialized << '\r\n'
 	serialized << self.body
-	return serialized.join('\r\n')
+	ret := serialized.join('\r\n')
+	return ret
 }
 
 struct ApiResponse {
@@ -213,50 +357,51 @@ fn server_handler(req HttpRequest) !HttpResponse {
 	method := req.buffer[req.method.start..req.method.start + req.method.len].bytestr()
 	path := req.buffer[req.path.start..req.path.start + req.path.len].bytestr()
 	body := req.buffer[req.body.start..req.body.start + req.body.len].bytestr()
-
+	mut ret := HttpResponse{
+		content: default_bad_request.bytes()
+	}
 	if method == 'GET' && path == '/ready' {
-		return HttpResponse{
-			content: default_ok.bytes()
-		}
+		ret.content = default_ok.bytes()
 	} else if method == 'POST' && path == '/fraud-score' {
-		transaction := json2.decode[Transaction](body) or {
-			return HttpResponse{
-				content: default_bad_request.bytes()
-			}
-		}
-		points := get_closest(transaction)!
-		frauds := points.filter(fn (v QDrantPoint) bool {
-			return v.payload['label'] == 'fraud'
-		}).len
-		score := f64(frauds) / 5.0
-		payload := json2.encode(ApiResponse{
-			approved:    score < 0.5
-			fraud_score: score
-		})
-		response := MyResponse{
-			status:         200
-			status_message: 'OK'
-			headers:        {
-				'Content-Length': (payload.len + 2).str()
-			}
-			body:           payload
-		}
-		return HttpResponse{
-			content: response.serialize().bytes()
+		if transaction := json2.decode[Transaction](body) {
+			db := &hnsw.HNSW[Reference](req.user_data)
+			stopwatch := time.new_stopwatch(time.StopWatchOptions{})
+			points := db.knn_search(Reference{
+				vector: transaction.vectorize()!
+				label:  ''
+			}, 5, 50)
+			fraud_count := points.filter(fn (p Reference) bool {
+				return p.label.contains('fraud')
+			}).len
+			fraud_score := f64(fraud_count) / 5.0
+			payload := json2.encode(ApiResponse{
+				approved:    fraud_score < 0.6
+				fraud_score: fraud_score
+			})
+
+			ret.content =
+				'HTTP/1.1 200 OK\r\nContent-Length: ${payload.len}\r\n\r\n${payload}'.bytes()
 		}
 	} else {
-		return HttpResponse{
-			content: default_not_found.bytes()
-		}
+		ret.content = default_not_found.bytes()
 	}
+	return ret
 }
 
 fn main() {
-	init()
+	println('Initializing vector database...')
+	mut db := hnsw.new_hnsw[Reference](3000000, 5, 400)
+	if os.args.len > 1 && os.args[1] == 'init' {
+		init_db(mut &db)
+		db.snapshot('db')!
+	} else {
+		db = hnsw.load_hnsw_snapshot[Reference]('db')!
+	}
 	server := fasthttp.new_server(ServerConfig{
-		family:  net.AddrFamily.ip
-		port:    9999
-		handler: server_handler
+		family:    net.AddrFamily.ip
+		port:      9999
+		handler:   server_handler
+		user_data: &db
 	})!
 	server.run()!
 }
