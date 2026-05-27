@@ -1,0 +1,44 @@
+main.v:108:7: notice: unused constant: `collection`
+  106 | }
+  107 | 
+  108 | const collection = 'rinha'
+      |       ~~~~~~~~~~~~~~~~~~~~
+  109 | const collection_distance = 'Cosine'
+  110 |
+main.v:109:7: notice: unused constant: `collection_distance`
+  107 | 
+  108 | const collection = 'rinha'
+  109 | const collection_distance = 'Cosine'
+      |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  110 | 
+  111 | fn get_reference(file os.File) !(Reference, i64) {
+main.v:123:7: notice: unused constant: `factor`
+  121 | }
+  122 | 
+  123 | const factor = 1000.0
+      |       ~~~~~~~~~~~~~~~
+  124 | 
+  125 | struct Offset {
+main.v:162:4: notice: unused function: `dot_prod`
+  160 | }
+  161 | 
+  162 | fn dot_prod(one []f64, other []f64) f64 {
+      |    ~~~~~~~~
+  163 |     mut dot := 0.0
+  164 |     mut norm_a := 0.0
+main.v:217:7: warning: unused variable: `count`
+  215 |     for {
+  216 |         value := <-channel or { break }
+  217 |         mut count := 0.0
+      |             ~~~~~
+  218 |         for index in value {
+  219 |             count += 1.0
+main.v:222:4: warning: unused variable: `stopwatch`
+  220 |             file.seek(index.offset, os.SeekMode.start) or { panic(err) }
+  221 |             reference, _ := get_reference(file) or { panic(err) }
+  222 |             stopwatch := time.new_stopwatch(time.StopWatchOptions{})
+      |             ~~~~~~~~~
+  223 |             db.insert(reference)
+  224 |             final << index
+Initializing vector database...
+listening on http://0.0.0.0:9999/

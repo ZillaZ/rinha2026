@@ -116,19 +116,8 @@ fn get_reference(file os.File) !(Reference, i64) {
 }
 
 struct ReferenceIndex {
-	dot_prod f64
-	offset   i64
-}
-
-struct Index {
-mut:
-	offsets []ReferenceIndex
-}
-
-fn (mut self Index) combine(index Index) {
-	for offset in index.offsets {
-		self.offsets << offset
-	}
+	vector []f64
+	offset i64
 }
 
 const factor = 1000.0
@@ -188,53 +177,31 @@ fn dot_prod(one []f64, other []f64) f64 {
 	return dot / (math.sqrt(norm_a) * math.sqrt(norm_b))
 }
 
-fn db_worker(channel chan &map[f64]Index, offset Offset) {
+fn db_worker(channel chan []ReferenceIndex, offset Offset) {
 	file := os.open('formatted.json') or { panic(err) }
 	mut count := 0.0
-	mut final := map[f64]Index{}
-	mut final_aux := -1.0
-	for final_aux <= 1.0 {
-		final[final_aux] = Index{}
-		final_aux += 1 / factor
-	}
-	pivot, _ := get_reference(file) or { panic(err) }
+	mut final := []ReferenceIndex{}
 	file.seek(offset.start, os.SeekMode.start) or { panic(err) }
 	mut acc_bytes := offset.start
-	max := 10000.0
+	max := 100.0
 	for {
 		if count == max {
 			break
 		}
-		println('${(count / max) * 100}% (${count})')
 		reference, bytecount := get_reference(file) or { break }
 		acc_bytes += bytecount
-		distance := dot_prod(reference.vector, pivot.vector)
-		aux := int(distance * factor)
-		new := f64(aux) / factor
-		if mut entry := final[new] {
-			entry.offsets << ReferenceIndex{
-				dot_prod: dot_prod(reference.vector, pivot.vector)
-				offset:   acc_bytes
-			}
-			final[new] = entry
-		} else {
-			final[new] = Index{
-				offsets: [
-					ReferenceIndex{
-						dot_prod: dot_prod(reference.vector, pivot.vector)
-						offset:   acc_bytes
-					},
-				]
-			}
+		final << ReferenceIndex{
+			vector: reference.vector
+			offset: acc_bytes
 		}
 		count += 1
 	}
-	channel <- &final
+	channel <- final
 }
 
 fn init_db(mut db hnsw.HNSW[Reference]) {
 	offsets := gen_offsets('formatted.json')
-	channel := chan &map[f64]Index{cap: workers}
+	channel := chan []ReferenceIndex{cap: workers}
 	mut threads := []thread{}
 	for i in 0 .. workers {
 		copy := offsets[i]
@@ -242,35 +209,19 @@ fn init_db(mut db hnsw.HNSW[Reference]) {
 	}
 	threads.wait()
 	channel.close()
-	mut final := map[f64]Index{}
+	mut final := []ReferenceIndex{}
 	file := os.open('formatted.json') or { panic(err) }
 
 	for {
 		value := <-channel or { break }
-		println('got all values, building database...')
 		mut count := 0.0
-		for key, index in value {
+		for index in value {
 			count += 1.0
-			if mut aux := final[key] {
-				for i in index.offsets {
-					file.seek(i.offset, os.SeekMode.start) or { panic(err) }
-					reference, _ := get_reference(file) or { panic(err) }
-					stopwatch := time.new_stopwatch(time.StopWatchOptions{})
-					db.insert(reference)
-					println('(${count / value.len * 100}%) reference inserted in ${stopwatch.elapsed().milliseconds()}ms')
-					aux.offsets << i
-				}
-				final[key] = aux
-				continue
-			}
-			for i in index.offsets {
-				file.seek(i.offset, os.SeekMode.start) or { panic(err) }
-				reference, _ := get_reference(file) or { panic(err) }
-				stopwatch := time.new_stopwatch(time.StopWatchOptions{})
-				db.insert(reference)
-				println('(${count / value.len * 100}%) reference inserted in ${stopwatch.elapsed().milliseconds()}ms')
-			}
-			final[key] = index
+			file.seek(index.offset, os.SeekMode.start) or { panic(err) }
+			reference, _ := get_reference(file) or { panic(err) }
+			stopwatch := time.new_stopwatch(time.StopWatchOptions{})
+			db.insert(reference)
+			final << index
 		}
 	}
 }
@@ -294,11 +245,11 @@ pub fn (self Reference) to_bytes() []u8 {
 		aux := binary.big_endian_get_u64(bits)
 		ret << aux
 	}
-	mut label_bytes := self.label.bytes()
-	for _ in label_bytes.len .. 6 {
-		label_bytes << 0
+	mut aux := self.label.bytes()
+	for _ in 0 .. 6 - self.label.len {
+		aux << 0
 	}
-	ret << label_bytes
+	ret << aux
 
 	fret := arrays.flatten(ret)
 	return fret
@@ -311,14 +262,14 @@ pub fn Reference.from_bytes(bytes []u8) Reference {
 
 		vector << math.f64_from_bits(bits)
 	}
-	label := bytes[14 * 8..].bytestr()
+	label := bytes[14 * 8..14 * 8 + 6].bytestr()
 	return Reference{
 		vector: vector
 		label:  label
 	}
 }
 
-pub fn Reference.byte_size() int {
+pub fn Reference.byte_size() u64 {
 	return 14 * 8 + 6
 }
 
@@ -353,6 +304,57 @@ struct ApiResponse {
 	fraud_score f64
 }
 
+@[unsafe]
+fn (t &Transaction) free() {
+	unsafe {
+		t.id.free()
+		t.transaction.free()
+		t.customer.free()
+		t.merchant.free()
+		t.terminal.free()
+		if last := t.last_transaction {
+			last.free()
+		}
+	}
+}
+
+@[unsafe]
+fn (t &TransactionInfo) free() {
+	unsafe { t.requested_at.free() }
+}
+
+@[unsafe]
+fn (c &Customer) free() {
+	unsafe {
+		c.known_merchants.free()
+	}
+}
+
+@[unsafe]
+fn (m &Merchant) free() {
+	unsafe {
+		m.id.free()
+		m.mcc.free()
+	}
+}
+
+@[unsafe]
+fn (t &Terminal) free() {}
+
+@[unsafe]
+fn (l &LastTransaction) free() {
+	unsafe { l.timestamp.free() }
+}
+
+@[unsafe]
+fn (r &Reference) free() {
+	unsafe {
+		r.vector.free()
+		r.label.free()
+	}
+}
+
+@[manualfree]
 fn server_handler(req HttpRequest) !HttpResponse {
 	method := req.buffer[req.method.start..req.method.start + req.method.len].bytestr()
 	path := req.buffer[req.path.start..req.path.start + req.path.len].bytestr()
@@ -364,12 +366,13 @@ fn server_handler(req HttpRequest) !HttpResponse {
 		ret.content = default_ok.bytes()
 	} else if method == 'POST' && path == '/fraud-score' {
 		if transaction := json2.decode[Transaction](body) {
-			db := &hnsw.HNSW[Reference](req.user_data)
-			stopwatch := time.new_stopwatch(time.StopWatchOptions{})
-			points := db.knn_search(Reference{
+			mut db := &hnsw.HNSW[Reference](req.user_data)
+			mut query := Reference{
 				vector: transaction.vectorize()!
 				label:  ''
-			}, 5, 50)
+			}
+			points := db.knn_search(query, 5, 50)
+			unsafe { query.vector.free() }
 			fraud_count := points.filter(fn (p Reference) bool {
 				return p.label.contains('fraud')
 			}).len
@@ -381,6 +384,11 @@ fn server_handler(req HttpRequest) !HttpResponse {
 
 			ret.content =
 				'HTTP/1.1 200 OK\r\nContent-Length: ${payload.len}\r\n\r\n${payload}'.bytes()
+			unsafe {
+				points.free()
+				transaction.free()
+				payload.free()
+			}
 		}
 	} else {
 		ret.content = default_not_found.bytes()
@@ -390,13 +398,15 @@ fn server_handler(req HttpRequest) !HttpResponse {
 
 fn main() {
 	println('Initializing vector database...')
-	mut db := hnsw.new_hnsw[Reference](3000000, 5, 400)
+	mut db := hnsw.HNSW[Reference]{}
 	if os.args.len > 1 && os.args[1] == 'init' {
+		db = hnsw.new_hnsw[Reference](5, 400)
 		init_db(mut &db)
-		db.snapshot('db')!
-	} else {
-		db = hnsw.load_hnsw_snapshot[Reference]('db')!
+		db.snapshot()!
+		println('Database initialized successfully.')
+		return
 	}
+	db = hnsw.HNSW.load_from_memory[Reference]()!
 	server := fasthttp.new_server(ServerConfig{
 		family:    net.AddrFamily.ip
 		port:      9999
